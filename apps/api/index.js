@@ -186,6 +186,7 @@ async function initDb() {
       title TEXT NOT NULL,
       body TEXT NOT NULL,
       tags TEXT,
+      pinned INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );`,
     `CREATE TABLE IF NOT EXISTS forum_replies (
@@ -1516,10 +1517,10 @@ app.post('/api/community/posts/:id/comments', requireAuth, async (req, res) => {
 
 app.get('/api/forum/threads', async (_req, res) => {
   const rows = await dbAll(
-    `SELECT t.id, t.title, t.body, t.tags, t.created_at, u.name as author
+    `SELECT t.id, t.title, t.body, t.tags, t.pinned, t.created_at, u.name as author
      FROM forum_threads t
      JOIN users u ON u.id = t.user_id
-     ORDER BY t.created_at DESC`
+     ORDER BY t.pinned DESC, t.created_at DESC`
   );
   res.json({ threads: rows });
 });
@@ -1531,10 +1532,25 @@ app.post('/api/forum/threads', requireAuth, async (req, res) => {
   }
   const id = crypto.randomUUID();
   await dbRun(
-    'INSERT INTO forum_threads (id, user_id, title, body, tags, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+    'INSERT INTO forum_threads (id, user_id, title, body, tags, pinned, created_at) VALUES ($1, $2, $3, $4, $5, 0, $6)',
     [id, req.user.id, String(title), String(body), String(tags || ''), new Date().toISOString()]
   );
   res.json({ ok: true, id });
+});
+
+app.patch('/api/forum/threads/:id/pin', requireAuth, async (req, res) => {
+  if (!req.isAdmin) {
+    return res.status(403).json({ error: 'Admin only.' });
+  }
+  const { pinned } = req.body || {};
+  if (typeof pinned !== 'boolean') {
+    return res.status(400).json({ error: 'pinned must be boolean.' });
+  }
+  await dbRun('UPDATE forum_threads SET pinned = $1 WHERE id = $2', [
+    pinned ? 1 : 0,
+    req.params.id,
+  ]);
+  res.json({ ok: true });
 });
 
 app.get('/api/forum/threads/:id/replies', async (req, res) => {
