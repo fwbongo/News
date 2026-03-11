@@ -35,6 +35,7 @@ app.use(morgan('dev'));
 const cache = {
   news: { fetchedAt: 0, data: [] },
   calendar: { fetchedAt: 0, data: [] },
+  forex: new Map(),
 };
 
 const dataDir = path.join(__dirname, 'data');
@@ -98,6 +99,10 @@ function now() {
 
 function isFresh(entry) {
   return entry.fetchedAt && now() - entry.fetchedAt < CACHE_TTL_MS;
+}
+
+function getForexCacheKey(pair, days) {
+  return `${pair}:${days}`;
 }
 
 async function fetchHtml(url) {
@@ -273,6 +278,55 @@ function requireAuth(req, res, next) {
   }
 }
 
+async function getForexSeries(pair, days = 30) {
+  const normalizedPair = String(pair || '').toUpperCase();
+  const [base, quote] = normalizedPair.split('/');
+  if (!base || !quote) {
+    throw new Error('Invalid pair');
+  }
+  const safeDays = Math.max(5, Math.min(120, Number(days) || 30));
+  const key = getForexCacheKey(normalizedPair, safeDays);
+  const existing = cache.forex.get(key);
+  if (existing && isFresh(existing)) return existing.data;
+
+  const endDate = new Date();
+  const startDate = new Date();
+  startDate.setDate(endDate.getDate() - safeDays);
+  const formatDate = (date) => date.toISOString().slice(0, 10);
+  const start = formatDate(startDate);
+  const end = formatDate(endDate);
+
+  const url = `https://api.frankfurter.dev/v1/${start}..${end}?base=${base}&symbols=${quote}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error('Failed to fetch forex data');
+  }
+  const payload = await response.json();
+  const points = Object.entries(payload.rates || {})
+    .map(([date, rateObj]) => ({
+      date,
+      value: rateObj[quote],
+    }))
+    .filter((point) => Number.isFinite(point.value))
+    .sort((a, b) => (a.date > b.date ? 1 : -1));
+
+  if (!points.length) {
+    throw new Error('No forex data available');
+  }
+
+  const data = {
+    pair: normalizedPair,
+    base,
+    quote,
+    start_date: payload.start_date,
+    end_date: payload.end_date,
+    points,
+  };
+
+  cache.forex.set(key, { fetchedAt: now(), data });
+  return data;
+}
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
@@ -292,6 +346,16 @@ app.get('/api/forex-factory/calendar', async (_req, res) => {
     res.json({ items, cachedAt: cache.calendar.fetchedAt });
   } catch (error) {
     res.status(502).json({ error: 'Failed to fetch calendar', detail: error.message });
+  }
+});
+
+app.get('/api/forex/rates', async (req, res) => {
+  try {
+    const { pair, days } = req.query || {};
+    const data = await getForexSeries(pair, days);
+    res.json(data);
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Failed to fetch forex rates' });
   }
 });
 
