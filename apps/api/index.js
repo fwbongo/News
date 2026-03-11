@@ -632,6 +632,31 @@ async function getCryptoFearGreed() {
   };
 }
 
+async function getTimeSeries(symbol, interval = '1h', outputsize = 24) {
+  if (!TWELVE_DATA_API_KEY) {
+    throw new Error('Price feed not configured');
+  }
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(
+    symbol
+  )}&interval=${encodeURIComponent(interval)}&outputsize=${outputsize}&timezone=UTC&format=JSON&apikey=${TWELVE_DATA_API_KEY}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error('Failed to fetch time series');
+  }
+  const payload = await response.json();
+  if (payload?.status === 'error') {
+    throw new Error(payload?.message || 'Failed to fetch time series');
+  }
+  const points = (payload.values || [])
+    .map((item) => ({
+      datetime: item.datetime,
+      value: Number(item.close),
+    }))
+    .filter((point) => Number.isFinite(point.value))
+    .reverse();
+  return { symbol, points };
+}
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
@@ -691,6 +716,28 @@ app.get('/api/market/quotes', async (req, res) => {
     res.json({ items: data });
   } catch (error) {
     res.status(400).json({ error: error.message || 'Failed to fetch quotes' });
+  }
+});
+
+app.get('/api/market/series', async (req, res) => {
+  try {
+    const { symbols, interval, outputsize } = req.query || {};
+    const list = String(symbols || '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (!list.length) {
+      return res.status(400).json({ error: 'No symbols provided' });
+    }
+    const data = await Promise.all(
+      list.map((symbol) =>
+        getTimeSeries(symbol, String(interval || '1h'), Number(outputsize) || 24)
+          .catch(() => ({ symbol, points: [] }))
+      )
+    );
+    res.json({ items: data });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Failed to fetch market series' });
   }
 });
 
