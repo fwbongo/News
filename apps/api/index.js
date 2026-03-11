@@ -25,6 +25,8 @@ const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@example.com';
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 
 app.use(cors());
@@ -81,6 +83,13 @@ db.exec(`
     last_sent_key TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+  CREATE TABLE IF NOT EXISTS announcements (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS web_push_subscriptions (
     id TEXT PRIMARY KEY,
@@ -243,9 +252,13 @@ async function getForexFactoryCalendar() {
   return cache.calendar.data;
 }
 
-function createToken(user) {
+function isAdminEmail(email) {
+  return ADMIN_EMAIL && email && email.toLowerCase() === ADMIN_EMAIL;
+}
+
+function createToken(user, isAdmin) {
   return jwt.sign(
-    { sub: user.id, email: user.email },
+    { sub: user.id, email: user.email, isAdmin: Boolean(isAdmin) },
     JWT_SECRET,
     { expiresIn: '30d' }
   );
@@ -272,6 +285,7 @@ function requireAuth(req, res, next) {
       return res.status(401).json({ error: 'Not authenticated.' });
     }
     req.user = user;
+    req.isAdmin = Boolean(payload.isAdmin) || isAdminEmail(user.email);
     return next();
   } catch (error) {
     return res.status(401).json({ error: 'Not authenticated.' });
@@ -488,6 +502,9 @@ app.post('/api/auth/register', async (req, res) => {
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
   }
+  if (isAdminEmail(email)) {
+    return res.status(403).json({ error: 'Admin account must be created by the server.' });
+  }
   if (getUserByEmail(email)) {
     return res.status(409).json({ error: 'Account already exists.' });
   }
@@ -505,28 +522,54 @@ app.post('/api/auth/register', async (req, res) => {
     'INSERT INTO users (id, email, name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)'
   ).run(user.id, user.email, user.name, user.password_hash, user.created_at);
 
-  const token = createToken(user);
+  const token = createToken(user, false);
 
   return res.json({
     token,
-    user: { id: user.id, email: user.email, name: user.name },
+    user: { id: user.id, email: user.email, name: user.name, isAdmin: false },
   });
 });
 
 app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body || {};
-  const user = getUserByEmail(email);
+  const normalized = String(email || '').toLowerCase();
+  const isAdmin = isAdminEmail(normalized);
+  if (isAdmin) {
+    if (!ADMIN_PASSWORD || password !== ADMIN_PASSWORD) {
+      return res.status(401).json({ error: 'Invalid credentials.' });
+    }
+    let user = getUserByEmail(normalized);
+    if (!user) {
+      const passwordHash = bcrypt.hashSync(ADMIN_PASSWORD, 10);
+      user = {
+        id: crypto.randomUUID(),
+        email: normalized,
+        name: normalized.split('@')[0],
+        password_hash: passwordHash,
+        created_at: new Date().toISOString(),
+      };
+      db.prepare(
+        'INSERT INTO users (id, email, name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)'
+      ).run(user.id, user.email, user.name, user.password_hash, user.created_at);
+    }
+    const token = createToken(user, true);
+    return res.json({ token, user: { id: user.id, email: user.email, name: user.name, isAdmin: true } });
+  }
+
+  const user = getUserByEmail(normalized);
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
     return res.status(401).json({ error: 'Invalid credentials.' });
   }
 
-  const token = createToken(user);
-  return res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
+  const token = createToken(user, false);
+  return res.json({ token, user: { id: user.id, email: user.email, name: user.name, isAdmin: false } });
 });
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
   const user = req.user;
-  return res.json({ user: { id: user.id, email: user.email, name: user.name } });
+  return res.json({
+    user: { id: user.id, email: user.email, name: user.name, isAdmin: Boolean(req.isAdmin) },
+  });
 });
 
 app.get('/api/watchlist', requireAuth, (req, res) => {
@@ -604,6 +647,36 @@ app.post('/api/push/web/subscribe', requireAuth, (req, res) => {
     // Ignore duplicates.
   }
   return res.json({ ok: true });
+});
+
+app.get('/api/announcements', (_req, res) => {
+  const rows = db
+    .prepare('SELECT id, title, body, created_at FROM announcements WHERE active = 1 ORDER BY created_at DESC')
+    .all();
+  res.json({ announcements: rows });
+});
+
+app.post('/api/announcements', requireAuth, (req, res) => {
+  if (!req.isAdmin) {
+    return res.status(403).json({ error: 'Admin only.' });
+  }
+  const { title, body } = req.body || {};
+  if (!title || !body) {
+    return res.status(400).json({ error: 'Title and body are required.' });
+  }
+  const id = crypto.randomUUID();
+  db.prepare(
+    'INSERT INTO announcements (id, title, body, active, created_at) VALUES (?, ?, ?, 1, ?)'
+  ).run(id, title.trim(), body.trim(), new Date().toISOString());
+  res.json({ ok: true, id });
+});
+
+app.delete('/api/announcements/:id', requireAuth, (req, res) => {
+  if (!req.isAdmin) {
+    return res.status(403).json({ error: 'Admin only.' });
+  }
+  db.prepare('DELETE FROM announcements WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
 });
 
 app.get('/api/alerts', requireAuth, (req, res) => {
