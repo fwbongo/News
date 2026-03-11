@@ -125,6 +125,31 @@ db.exec(`
     UNIQUE(user_id, endpoint),
     FOREIGN KEY(user_id) REFERENCES users(id)
   );
+  CREATE TABLE IF NOT EXISTS referral_codes (
+    user_id TEXT PRIMARY KEY,
+    code TEXT UNIQUE NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+  CREATE TABLE IF NOT EXISTS referrals (
+    id TEXT PRIMARY KEY,
+    referrer_user_id TEXT NOT NULL,
+    referred_user_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(referrer_user_id, referred_user_id),
+    FOREIGN KEY(referrer_user_id) REFERENCES users(id),
+    FOREIGN KEY(referred_user_id) REFERENCES users(id)
+  );
+  CREATE TABLE IF NOT EXISTS alert_events (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT,
+    channel TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
 `);
 
 try {
@@ -303,6 +328,37 @@ function getUserById(id) {
   return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
 }
 
+function getReferralCode(userId) {
+  return db.prepare('SELECT code FROM referral_codes WHERE user_id = ?').get(userId)?.code || null;
+}
+
+function getUserIdByReferralCode(code) {
+  return db.prepare('SELECT user_id FROM referral_codes WHERE code = ?').get(code)?.user_id || null;
+}
+
+function createReferralCode(user) {
+  const base = `${user.email}:${user.id}`;
+  let hash = 0;
+  for (let i = 0; i < base.length; i += 1) {
+    hash = (hash * 31 + base.charCodeAt(i)) % 1000000;
+  }
+  return `fx${Math.abs(hash).toString(36)}`;
+}
+
+function ensureReferralCode(user) {
+  const existing = getReferralCode(user.id);
+  if (existing) return existing;
+  const code = createReferralCode(user);
+  try {
+    db.prepare(
+      'INSERT INTO referral_codes (user_id, code, created_at) VALUES (?, ?, ?)'
+    ).run(user.id, code, new Date().toISOString());
+  } catch (error) {
+    return getReferralCode(user.id);
+  }
+  return code;
+}
+
 function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.replace('Bearer ', '');
@@ -430,6 +486,33 @@ async function getIntradaySeries(pair, interval, outputsize = 120) {
   return data;
 }
 
+async function getLatestPrice(pair) {
+  const normalizedPair = String(pair || '').toUpperCase();
+  const [base, quote] = normalizedPair.split('/');
+  if (!base || !quote) {
+    throw new Error('Invalid pair');
+  }
+  if (!TWELVE_DATA_API_KEY) {
+    throw new Error('Price feed not configured');
+  }
+  const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(
+    `${base}/${quote}`
+  )}&apikey=${TWELVE_DATA_API_KEY}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error('Failed to fetch price');
+  }
+  const payload = await response.json();
+  if (payload?.status === 'error') {
+    throw new Error(payload?.message || 'Failed to fetch price');
+  }
+  const value = Number(payload?.price);
+  if (!Number.isFinite(value)) {
+    throw new Error('No price available');
+  }
+  return { pair: normalizedPair, value, timestamp: Math.floor(Date.now() / 1000) };
+}
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
@@ -469,6 +552,16 @@ app.get('/api/forex/candles', async (req, res) => {
     res.json(data);
   } catch (error) {
     res.status(400).json({ error: error.message || 'Failed to fetch intraday rates' });
+  }
+});
+
+app.get('/api/forex/price', async (req, res) => {
+  try {
+    const { pair } = req.query || {};
+    const data = await getLatestPrice(pair);
+    res.json(data);
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Failed to fetch latest price' });
   }
 });
 
@@ -515,6 +608,24 @@ async function sendWebPush(subscriptions, title, body, data = {}) {
       }
     })
   );
+}
+
+function recordAlertEvent(userId, type, title, detail, channel) {
+  try {
+    db.prepare(
+      'INSERT INTO alert_events (id, user_id, type, title, detail, channel, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(
+      crypto.randomUUID(),
+      userId,
+      type,
+      title,
+      detail || null,
+      channel || null,
+      new Date().toISOString()
+    );
+  } catch (error) {
+    // Ignore event logging errors.
+  }
 }
 
 async function sendEmailAlert(to, subject, html) {
@@ -599,17 +710,42 @@ async function runAlertChecks() {
             match.title,
             { url: match.url }
           );
+          if (tokens.length) {
+            recordAlertEvent(
+              alert.user_id,
+              'news',
+              match.title,
+              match.url || '',
+              'push'
+            );
+          }
           await sendWebPush(
             webSubs,
             'News alert',
             match.title,
             { url: match.url }
           );
+          if (webSubs.length) {
+            recordAlertEvent(
+              alert.user_id,
+              'news',
+              match.title,
+              match.url || '',
+              'web'
+            );
+          }
           if (emailEnabled && user?.email) {
             await sendEmailAlert(
               user.email,
               `News alert: ${match.title}`,
               `<p>${match.title}</p><p><a href="${match.url}">Read source</a></p>`
+            );
+            recordAlertEvent(
+              alert.user_id,
+              'news',
+              match.title,
+              match.url || '',
+              'email'
             );
           }
         }
@@ -625,23 +761,49 @@ async function runAlertChecks() {
           const key = `${match.event}-${match.time || ''}`;
           if (alert.last_sent_key === key) continue;
           db.prepare('UPDATE alerts SET last_sent_key = ? WHERE id = ?').run(key, alert.id);
+          const title = `${match.currency || ''} ${match.event}`.trim();
           await sendExpoPush(
             tokens,
             'Calendar alert',
-            `${match.currency || ''} ${match.event}`.trim(),
+            title,
             { event: match.event }
           );
+          if (tokens.length) {
+            recordAlertEvent(
+              alert.user_id,
+              'calendar',
+              title,
+              match.impact || '',
+              'push'
+            );
+          }
           await sendWebPush(
             webSubs,
             'Calendar alert',
-            `${match.currency || ''} ${match.event}`.trim(),
+            title,
             { event: match.event }
           );
+          if (webSubs.length) {
+            recordAlertEvent(
+              alert.user_id,
+              'calendar',
+              title,
+              match.impact || '',
+              'web'
+            );
+          }
           if (emailEnabled && user?.email) {
             await sendEmailAlert(
               user.email,
               'Calendar alert',
-              `<p>${match.currency || ''} ${match.event}</p><p>Impact: ${match.impact || 'n/a'}</p>`
+              `<p>${title}</p><p>Impact: ${match.impact || 'n/a'}</p>`
+            );
+            recordAlertEvent(
+              alert.user_id,
+              'calendar',
+              title,
+              match.impact || '',
+              'email'
             );
           }
         }
@@ -682,12 +844,19 @@ async function runAlertChecks() {
           const message = `${alert.pair} is ${alert.direction} ${alert.value}`;
           await sendExpoPush(tokens, 'Price alert', message, { pair: alert.pair });
           await sendWebPush(webSubs, 'Price alert', message, { pair: alert.pair });
+          if (tokens.length) {
+            recordAlertEvent(alert.user_id, 'price', message, '', 'push');
+          }
+          if (webSubs.length) {
+            recordAlertEvent(alert.user_id, 'price', message, '', 'web');
+          }
           if (emailEnabled && user?.email) {
             await sendEmailAlert(
               user.email,
               'Price alert',
               `<p>${message}</p>`
             );
+            recordAlertEvent(alert.user_id, 'price', message, '', 'email');
           }
         }
       }
@@ -708,12 +877,19 @@ async function runAlertChecks() {
           const message = `${alert.pair} moved ${changePct.toFixed(2)}% over ${windowDays}d`;
           await sendExpoPush(tokens, 'Percent alert', message, { pair: alert.pair });
           await sendWebPush(webSubs, 'Percent alert', message, { pair: alert.pair });
+          if (tokens.length) {
+            recordAlertEvent(alert.user_id, 'percent', message, '', 'push');
+          }
+          if (webSubs.length) {
+            recordAlertEvent(alert.user_id, 'percent', message, '', 'web');
+          }
           if (emailEnabled && user?.email) {
             await sendEmailAlert(
               user.email,
               'Percent alert',
               `<p>${message}</p>`
             );
+            recordAlertEvent(alert.user_id, 'percent', message, '', 'email');
           }
         }
       }
@@ -725,7 +901,7 @@ async function runAlertChecks() {
 }
 
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, name } = req.body || {};
+  const { email, password, name, refCode } = req.body || {};
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
   }
@@ -749,11 +925,32 @@ app.post('/api/auth/register', async (req, res) => {
     'INSERT INTO users (id, email, name, password_hash, created_at, email_alerts) VALUES (?, ?, ?, ?, ?, 0)'
   ).run(user.id, user.email, user.name, user.password_hash, user.created_at);
 
+  const userCode = ensureReferralCode(user);
+  if (refCode) {
+    const referrerId = getUserIdByReferralCode(String(refCode).trim());
+    if (referrerId && referrerId !== user.id) {
+      try {
+        db.prepare(
+          'INSERT INTO referrals (id, referrer_user_id, referred_user_id, created_at) VALUES (?, ?, ?, ?)'
+        ).run(crypto.randomUUID(), referrerId, user.id, new Date().toISOString());
+      } catch (error) {
+        // Ignore duplicate referrals.
+      }
+    }
+  }
+
   const token = createToken(user, false);
 
   return res.json({
     token,
-    user: { id: user.id, email: user.email, name: user.name, isAdmin: false, emailAlerts: false },
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      isAdmin: false,
+      emailAlerts: false,
+      referralCode: userCode,
+    },
   });
 });
 
@@ -779,6 +976,7 @@ app.post('/api/auth/login', (req, res) => {
         'INSERT INTO users (id, email, name, password_hash, created_at, email_alerts) VALUES (?, ?, ?, ?, ?, 0)'
       ).run(user.id, user.email, user.name, user.password_hash, user.created_at);
     }
+    const code = ensureReferralCode(user);
     const token = createToken(user, true);
     return res.json({
       token,
@@ -788,6 +986,7 @@ app.post('/api/auth/login', (req, res) => {
         name: user.name,
         isAdmin: true,
         emailAlerts: Boolean(user.email_alerts),
+        referralCode: code,
       },
     });
   }
@@ -798,6 +997,7 @@ app.post('/api/auth/login', (req, res) => {
   }
 
   const token = createToken(user, false);
+  const code = ensureReferralCode(user);
   return res.json({
     token,
     user: {
@@ -806,12 +1006,14 @@ app.post('/api/auth/login', (req, res) => {
       name: user.name,
       isAdmin: false,
       emailAlerts: Boolean(user.email_alerts),
+      referralCode: code,
     },
   });
 });
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
   const user = req.user;
+  const code = ensureReferralCode(user);
   return res.json({
     user: {
       id: user.id,
@@ -819,6 +1021,7 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
       name: user.name,
       isAdmin: Boolean(req.isAdmin),
       emailAlerts: Boolean(user.email_alerts),
+      referralCode: code,
     },
   });
 });
@@ -830,6 +1033,7 @@ app.patch('/api/users/me', requireAuth, (req, res) => {
   }
   db.prepare('UPDATE users SET email_alerts = ? WHERE id = ?').run(emailAlerts ? 1 : 0, req.user.id);
   const user = getUserById(req.user.id);
+  const code = ensureReferralCode(user);
   res.json({
     user: {
       id: user.id,
@@ -837,7 +1041,28 @@ app.patch('/api/users/me', requireAuth, (req, res) => {
       name: user.name,
       isAdmin: Boolean(req.isAdmin),
       emailAlerts: Boolean(user.email_alerts),
+      referralCode: code,
     },
+  });
+});
+
+app.get('/api/referrals/me', requireAuth, (req, res) => {
+  const code = ensureReferralCode(req.user);
+  const total = db
+    .prepare('SELECT COUNT(*) as count FROM referrals WHERE referrer_user_id = ?')
+    .get(req.user.id)?.count || 0;
+  const active = db
+    .prepare(
+      `SELECT COUNT(DISTINCT r.referred_user_id) as count
+       FROM referrals r
+       JOIN watchlist w ON w.user_id = r.referred_user_id
+       WHERE r.referrer_user_id = ?`
+    )
+    .get(req.user.id)?.count || 0;
+  res.json({
+    code,
+    total,
+    active,
   });
 });
 
@@ -977,6 +1202,16 @@ app.get('/api/price-alerts', requireAuth, (req, res) => {
     .prepare('SELECT id, pair, type, direction, value, window_days, created_at FROM price_alerts WHERE user_id = ?')
     .all(req.user.id);
   res.json({ alerts: rows });
+});
+
+app.get('/api/alert-events', requireAuth, (req, res) => {
+  const limit = Math.max(10, Math.min(200, Number(req.query?.limit) || 50));
+  const rows = db
+    .prepare(
+      'SELECT id, type, title, detail, channel, created_at FROM alert_events WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'
+    )
+    .all(req.user.id, limit);
+  res.json({ events: rows });
 });
 
 app.post('/api/price-alerts', requireAuth, (req, res) => {
