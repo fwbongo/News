@@ -15,6 +15,13 @@ try {
 } catch (error) {
   webPush = null;
 }
+let resendClient;
+try {
+  const { Resend } = require('resend');
+  resendClient = Resend;
+} catch (error) {
+  resendClient = null;
+}
 
 const app = express();
 
@@ -28,6 +35,11 @@ const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@example.com';
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || '';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const RESEND_FROM = process.env.RESEND_FROM || 'Trading News <noreply@example.com>';
+const RESEND_REPLY_TO = process.env.RESEND_REPLY_TO || '';
+const resend = resendClient && RESEND_API_KEY ? new resendClient(RESEND_API_KEY) : null;
 
 app.use(cors());
 app.use(helmet());
@@ -114,6 +126,12 @@ db.exec(`
     FOREIGN KEY(user_id) REFERENCES users(id)
   );
 `);
+
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN email_alerts INTEGER NOT NULL DEFAULT 0').run();
+} catch (error) {
+  // Column already exists.
+}
 
 function now() {
   return Date.now();
@@ -332,6 +350,7 @@ async function getForexSeries(pair, days = 30) {
   const points = Object.entries(payload.rates || {})
     .map(([date, rateObj]) => ({
       date,
+      timestamp: Math.floor(new Date(`${date}T00:00:00Z`).getTime() / 1000),
       value: rateObj[quote],
     }))
     .filter((point) => Number.isFinite(point.value))
@@ -351,6 +370,63 @@ async function getForexSeries(pair, days = 30) {
   };
 
   cache.forex.set(key, { fetchedAt: now(), data });
+  return data;
+}
+
+async function getIntradaySeries(pair, interval, outputsize = 120) {
+  const normalizedPair = String(pair || '').toUpperCase();
+  const [base, quote] = normalizedPair.split('/');
+  if (!base || !quote) {
+    throw new Error('Invalid pair');
+  }
+  if (!TWELVE_DATA_API_KEY) {
+    throw new Error('Intraday feed not configured');
+  }
+  const safeOutput = Math.max(10, Math.min(500, Number(outputsize) || 120));
+  const safeInterval = String(interval || '1h');
+  const cacheKey = getForexCacheKey(normalizedPair, `${safeInterval}:${safeOutput}`);
+  const existing = cache.forex.get(cacheKey);
+  if (existing && isFresh(existing)) return existing.data;
+
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(
+    `${base}/${quote}`
+  )}&interval=${encodeURIComponent(safeInterval)}&outputsize=${safeOutput}&timezone=UTC&format=JSON&apikey=${TWELVE_DATA_API_KEY}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error('Failed to fetch intraday data');
+  }
+  const payload = await response.json();
+  if (payload?.status === 'error') {
+    throw new Error(payload?.message || 'Failed to fetch intraday data');
+  }
+
+  const points = (payload.values || [])
+    .map((item) => {
+      const dateTime = String(item.datetime || '');
+      const iso = dateTime.includes('T') ? dateTime : dateTime.replace(' ', 'T');
+      const timestamp = Math.floor(Date.parse(`${iso}Z`) / 1000);
+      return {
+        datetime: dateTime,
+        timestamp,
+        value: Number(item.close),
+      };
+    })
+    .filter((point) => Number.isFinite(point.value) && Number.isFinite(point.timestamp))
+    .sort((a, b) => a.timestamp - b.timestamp);
+
+  if (!points.length) {
+    throw new Error('No intraday data available');
+  }
+
+  const data = {
+    pair: normalizedPair,
+    base,
+    quote,
+    interval: safeInterval,
+    points,
+  };
+
+  cache.forex.set(cacheKey, { fetchedAt: now(), data });
   return data;
 }
 
@@ -383,6 +459,16 @@ app.get('/api/forex/rates', async (req, res) => {
     res.json(data);
   } catch (error) {
     res.status(400).json({ error: error.message || 'Failed to fetch forex rates' });
+  }
+});
+
+app.get('/api/forex/candles', async (req, res) => {
+  try {
+    const { pair, interval, outputsize } = req.query || {};
+    const data = await getIntradaySeries(pair, interval, outputsize);
+    res.json(data);
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Failed to fetch intraday rates' });
   }
 });
 
@@ -429,6 +515,17 @@ async function sendWebPush(subscriptions, title, body, data = {}) {
       }
     })
   );
+}
+
+async function sendEmailAlert(to, subject, html) {
+  if (!resend || !RESEND_API_KEY || !RESEND_FROM) return;
+  await resend.emails.send({
+    from: RESEND_FROM,
+    to,
+    subject,
+    html,
+    replyTo: RESEND_REPLY_TO || undefined,
+  });
 }
 
 async function runAlertChecks() {
@@ -482,7 +579,9 @@ async function runAlertChecks() {
         .all(alert.user_id)
         .map((row) => JSON.parse(row.subscription_json));
 
-      if (!tokens.length && !webSubs.length) continue;
+      const user = getUserById(alert.user_id);
+      const emailEnabled = Boolean(user?.email_alerts);
+      if (!tokens.length && !webSubs.length && !emailEnabled) continue;
 
       if (alert.type === 'news_keyword') {
         const keyword = normalizeKey(alert.query);
@@ -506,6 +605,13 @@ async function runAlertChecks() {
             match.title,
             { url: match.url }
           );
+          if (emailEnabled && user?.email) {
+            await sendEmailAlert(
+              user.email,
+              `News alert: ${match.title}`,
+              `<p>${match.title}</p><p><a href="${match.url}">Read source</a></p>`
+            );
+          }
         }
       }
 
@@ -531,6 +637,13 @@ async function runAlertChecks() {
             `${match.currency || ''} ${match.event}`.trim(),
             { event: match.event }
           );
+          if (emailEnabled && user?.email) {
+            await sendEmailAlert(
+              user.email,
+              'Calendar alert',
+              `<p>${match.currency || ''} ${match.event}</p><p>Impact: ${match.impact || 'n/a'}</p>`
+            );
+          }
         }
       }
     }
@@ -538,7 +651,9 @@ async function runAlertChecks() {
     for (const alert of priceAlerts) {
       const tokens = getUserTokens(alert.user_id);
       const webSubs = getUserWebSubs(alert.user_id);
-      if (!tokens.length && !webSubs.length) continue;
+      const user = getUserById(alert.user_id);
+      const emailEnabled = Boolean(user?.email_alerts);
+      if (!tokens.length && !webSubs.length && !emailEnabled) continue;
 
       const windowDays = Number(alert.window_days || 1);
       let series;
@@ -567,6 +682,13 @@ async function runAlertChecks() {
           const message = `${alert.pair} is ${alert.direction} ${alert.value}`;
           await sendExpoPush(tokens, 'Price alert', message, { pair: alert.pair });
           await sendWebPush(webSubs, 'Price alert', message, { pair: alert.pair });
+          if (emailEnabled && user?.email) {
+            await sendEmailAlert(
+              user.email,
+              'Price alert',
+              `<p>${message}</p>`
+            );
+          }
         }
       }
 
@@ -586,6 +708,13 @@ async function runAlertChecks() {
           const message = `${alert.pair} moved ${changePct.toFixed(2)}% over ${windowDays}d`;
           await sendExpoPush(tokens, 'Percent alert', message, { pair: alert.pair });
           await sendWebPush(webSubs, 'Percent alert', message, { pair: alert.pair });
+          if (emailEnabled && user?.email) {
+            await sendEmailAlert(
+              user.email,
+              'Percent alert',
+              `<p>${message}</p>`
+            );
+          }
         }
       }
     }
@@ -617,14 +746,14 @@ app.post('/api/auth/register', async (req, res) => {
   };
 
   db.prepare(
-    'INSERT INTO users (id, email, name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)'
+    'INSERT INTO users (id, email, name, password_hash, created_at, email_alerts) VALUES (?, ?, ?, ?, ?, 0)'
   ).run(user.id, user.email, user.name, user.password_hash, user.created_at);
 
   const token = createToken(user, false);
 
   return res.json({
     token,
-    user: { id: user.id, email: user.email, name: user.name, isAdmin: false },
+    user: { id: user.id, email: user.email, name: user.name, isAdmin: false, emailAlerts: false },
   });
 });
 
@@ -647,11 +776,20 @@ app.post('/api/auth/login', (req, res) => {
         created_at: new Date().toISOString(),
       };
       db.prepare(
-        'INSERT INTO users (id, email, name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)'
+        'INSERT INTO users (id, email, name, password_hash, created_at, email_alerts) VALUES (?, ?, ?, ?, ?, 0)'
       ).run(user.id, user.email, user.name, user.password_hash, user.created_at);
     }
     const token = createToken(user, true);
-    return res.json({ token, user: { id: user.id, email: user.email, name: user.name, isAdmin: true } });
+    return res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        isAdmin: true,
+        emailAlerts: Boolean(user.email_alerts),
+      },
+    });
   }
 
   const user = getUserByEmail(normalized);
@@ -660,13 +798,46 @@ app.post('/api/auth/login', (req, res) => {
   }
 
   const token = createToken(user, false);
-  return res.json({ token, user: { id: user.id, email: user.email, name: user.name, isAdmin: false } });
+  return res.json({
+    token,
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      isAdmin: false,
+      emailAlerts: Boolean(user.email_alerts),
+    },
+  });
 });
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
   const user = req.user;
   return res.json({
-    user: { id: user.id, email: user.email, name: user.name, isAdmin: Boolean(req.isAdmin) },
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      isAdmin: Boolean(req.isAdmin),
+      emailAlerts: Boolean(user.email_alerts),
+    },
+  });
+});
+
+app.patch('/api/users/me', requireAuth, (req, res) => {
+  const { emailAlerts } = req.body || {};
+  if (typeof emailAlerts !== 'boolean') {
+    return res.status(400).json({ error: 'emailAlerts must be boolean.' });
+  }
+  db.prepare('UPDATE users SET email_alerts = ? WHERE id = ?').run(emailAlerts ? 1 : 0, req.user.id);
+  const user = getUserById(req.user.id);
+  res.json({
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      isAdmin: Boolean(req.isAdmin),
+      emailAlerts: Boolean(user.email_alerts),
+    },
   });
 });
 

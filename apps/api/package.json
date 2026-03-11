@@ -24,6 +24,7 @@
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.1",
+    "resend": "^3.2.0",
     "web-push": "^3.6.7"
   }
 }
