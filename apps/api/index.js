@@ -4,11 +4,9 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const cheerio = require('cheerio');
 const crypto = require('crypto');
-const path = require('path');
-const fs = require('fs');
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const Database = require('better-sqlite3');
 let webPush;
 try {
   webPush = require('web-push');
@@ -52,110 +50,173 @@ const cache = {
   forex: new Map(),
 };
 
-const dataDir = path.join(__dirname, 'data');
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
+});
+
+async function dbGet(sql, params = []) {
+  const { rows } = await pool.query(sql, params);
+  return rows[0] || null;
 }
 
-const db = new Database(path.join(dataDir, 'app.db'));
-db.pragma('journal_mode = WAL');
+async function dbAll(sql, params = []) {
+  const { rows } = await pool.query(sql, params);
+  return rows;
+}
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    email TEXT UNIQUE NOT NULL,
-    name TEXT NOT NULL,
-    password_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS watchlist (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE(user_id, symbol),
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS push_tokens (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    token TEXT NOT NULL,
-    platform TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE(user_id, token),
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS alerts (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    type TEXT NOT NULL,
-    query TEXT,
-    impact TEXT,
-    active INTEGER NOT NULL DEFAULT 1,
-    last_sent_key TEXT,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS announcements (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    body TEXT NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS price_alerts (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    pair TEXT NOT NULL,
-    type TEXT NOT NULL,
-    direction TEXT NOT NULL,
-    value REAL NOT NULL,
-    window_days INTEGER,
-    active INTEGER NOT NULL DEFAULT 1,
-    last_sent_key TEXT,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS web_push_subscriptions (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    endpoint TEXT NOT NULL,
-    subscription_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE(user_id, endpoint),
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS referral_codes (
-    user_id TEXT PRIMARY KEY,
-    code TEXT UNIQUE NOT NULL,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS referrals (
-    id TEXT PRIMARY KEY,
-    referrer_user_id TEXT NOT NULL,
-    referred_user_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE(referrer_user_id, referred_user_id),
-    FOREIGN KEY(referrer_user_id) REFERENCES users(id),
-    FOREIGN KEY(referred_user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS alert_events (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    type TEXT NOT NULL,
-    title TEXT NOT NULL,
-    detail TEXT,
-    channel TEXT,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-`);
+async function dbRun(sql, params = []) {
+  await pool.query(sql, params);
+}
 
-try {
-  db.prepare('ALTER TABLE users ADD COLUMN email_alerts INTEGER NOT NULL DEFAULT 0').run();
-} catch (error) {
-  // Column already exists.
+async function initDb() {
+  if (!process.env.DATABASE_URL) {
+    throw new Error('DATABASE_URL not set');
+  }
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      email_alerts INTEGER NOT NULL DEFAULT 0
+    );`,
+    `CREATE TABLE IF NOT EXISTS watchlist (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(user_id, symbol)
+    );`,
+    `CREATE TABLE IF NOT EXISTS push_tokens (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      token TEXT NOT NULL,
+      platform TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(user_id, token)
+    );`,
+    `CREATE TABLE IF NOT EXISTS alerts (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      query TEXT,
+      impact TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      last_sent_key TEXT,
+      created_at TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS announcements (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS price_alerts (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      pair TEXT NOT NULL,
+      type TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      value REAL NOT NULL,
+      window_days INTEGER,
+      active INTEGER NOT NULL DEFAULT 1,
+      last_sent_key TEXT,
+      created_at TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      endpoint TEXT NOT NULL,
+      subscription_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(user_id, endpoint)
+    );`,
+    `CREATE TABLE IF NOT EXISTS referral_codes (
+      user_id TEXT PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      created_at TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS referrals (
+      id TEXT PRIMARY KEY,
+      referrer_user_id TEXT NOT NULL,
+      referred_user_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(referrer_user_id, referred_user_id)
+    );`,
+    `CREATE TABLE IF NOT EXISTS alert_events (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      detail TEXT,
+      channel TEXT,
+      created_at TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS calendar_reminders (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      event TEXT NOT NULL,
+      time TEXT NOT NULL,
+      currency TEXT,
+      minutes_before INTEGER NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      last_sent_key TEXT,
+      created_at TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS community_posts (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS community_comments (
+      id TEXT PRIMARY KEY,
+      post_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS forum_threads (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      tags TEXT,
+      created_at TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS forum_replies (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS chat_messages (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS trade_journal (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      entry_price REAL,
+      exit_price REAL,
+      size REAL,
+      pnl REAL,
+      reasoning TEXT,
+      created_at TEXT NOT NULL
+    );`,
+  ];
+
+  for (const statement of statements) {
+    await pool.query(statement);
+  }
 }
 
 function now() {
@@ -320,20 +381,22 @@ function createToken(user, isAdmin) {
   );
 }
 
-function getUserByEmail(email) {
-  return db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+async function getUserByEmail(email) {
+  return dbGet('SELECT * FROM users WHERE email = $1', [email]);
 }
 
-function getUserById(id) {
-  return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+async function getUserById(id) {
+  return dbGet('SELECT * FROM users WHERE id = $1', [id]);
 }
 
-function getReferralCode(userId) {
-  return db.prepare('SELECT code FROM referral_codes WHERE user_id = ?').get(userId)?.code || null;
+async function getReferralCode(userId) {
+  const row = await dbGet('SELECT code FROM referral_codes WHERE user_id = $1', [userId]);
+  return row?.code || null;
 }
 
-function getUserIdByReferralCode(code) {
-  return db.prepare('SELECT user_id FROM referral_codes WHERE code = ?').get(code)?.user_id || null;
+async function getUserIdByReferralCode(code) {
+  const row = await dbGet('SELECT user_id FROM referral_codes WHERE code = $1', [code]);
+  return row?.user_id || null;
 }
 
 function createReferralCode(user) {
@@ -345,21 +408,22 @@ function createReferralCode(user) {
   return `fx${Math.abs(hash).toString(36)}`;
 }
 
-function ensureReferralCode(user) {
-  const existing = getReferralCode(user.id);
+async function ensureReferralCode(user) {
+  const existing = await getReferralCode(user.id);
   if (existing) return existing;
   const code = createReferralCode(user);
   try {
-    db.prepare(
-      'INSERT INTO referral_codes (user_id, code, created_at) VALUES (?, ?, ?)'
-    ).run(user.id, code, new Date().toISOString());
+    await dbRun(
+      'INSERT INTO referral_codes (user_id, code, created_at) VALUES ($1, $2, $3)',
+      [user.id, code, new Date().toISOString()]
+    );
   } catch (error) {
-    return getReferralCode(user.id);
+    return await getReferralCode(user.id);
   }
   return code;
 }
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.replace('Bearer ', '');
   if (!token) {
@@ -367,7 +431,7 @@ function requireAuth(req, res, next) {
   }
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = getUserById(payload.sub);
+    const user = await getUserById(payload.sub);
     if (!user) {
       return res.status(401).json({ error: 'Not authenticated.' });
     }
@@ -513,6 +577,61 @@ async function getLatestPrice(pair) {
   return { pair: normalizedPair, value, timestamp: Math.floor(Date.now() / 1000) };
 }
 
+async function getQuotes(symbols) {
+  if (!TWELVE_DATA_API_KEY) {
+    throw new Error('Price feed not configured');
+  }
+  const list = String(symbols || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!list.length) {
+    throw new Error('No symbols provided');
+  }
+  const url = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(
+    list.join(',')
+  )}&apikey=${TWELVE_DATA_API_KEY}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error('Failed to fetch quotes');
+  }
+  const payload = await response.json();
+  if (payload?.status === 'error') {
+    throw new Error(payload?.message || 'Failed to fetch quotes');
+  }
+  const normalize = (entry) => ({
+    symbol: entry.symbol,
+    price: Number(entry.price),
+    change: Number(entry.change),
+    percent_change: Number(entry.percent_change),
+    timestamp: entry.timestamp || null,
+  });
+  if (Array.isArray(payload)) {
+    return payload.map(normalize).filter((item) => Number.isFinite(item.price));
+  }
+  if (payload && payload.symbol) {
+    return [normalize(payload)].filter((item) => Number.isFinite(item.price));
+  }
+  return Object.values(payload || {}).map(normalize).filter((item) => Number.isFinite(item.price));
+}
+
+async function getCryptoFearGreed() {
+  const response = await fetch('https://api.alternative.me/fng/?limit=1');
+  if (!response.ok) {
+    throw new Error('Failed to fetch fear & greed');
+  }
+  const payload = await response.json();
+  const data = payload?.data?.[0];
+  if (!data) {
+    throw new Error('No fear & greed data');
+  }
+  return {
+    value: Number(data.value),
+    value_classification: data.value_classification,
+    timestamp: data.timestamp,
+  };
+}
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
@@ -565,6 +684,25 @@ app.get('/api/forex/price', async (req, res) => {
   }
 });
 
+app.get('/api/market/quotes', async (req, res) => {
+  try {
+    const { symbols } = req.query || {};
+    const data = await getQuotes(symbols);
+    res.json({ items: data });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Failed to fetch quotes' });
+  }
+});
+
+app.get('/api/crypto/fear-greed', async (_req, res) => {
+  try {
+    const data = await getCryptoFearGreed();
+    res.json(data);
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Failed to fetch fear & greed' });
+  }
+});
+
 function normalizeKey(value) {
   return String(value || '').trim().toLowerCase();
 }
@@ -601,27 +739,28 @@ async function sendWebPush(subscriptions, title, body, data = {}) {
       } catch (error) {
         // Remove invalid subscriptions.
         if (error?.statusCode === 410 || error?.statusCode === 404) {
-          db.prepare('DELETE FROM web_push_subscriptions WHERE endpoint = ?').run(
-            subscription.endpoint
-          );
+          await dbRun('DELETE FROM web_push_subscriptions WHERE endpoint = $1', [
+            subscription.endpoint,
+          ]);
         }
       }
     })
   );
 }
 
-function recordAlertEvent(userId, type, title, detail, channel) {
+async function recordAlertEvent(userId, type, title, detail, channel) {
   try {
-    db.prepare(
-      'INSERT INTO alert_events (id, user_id, type, title, detail, channel, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(
-      crypto.randomUUID(),
-      userId,
-      type,
-      title,
-      detail || null,
-      channel || null,
-      new Date().toISOString()
+    await dbRun(
+      'INSERT INTO alert_events (id, user_id, type, title, detail, channel, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [
+        crypto.randomUUID(),
+        userId,
+        type,
+        title,
+        detail || null,
+        channel || null,
+        new Date().toISOString(),
+      ]
     );
   } catch (error) {
     // Ignore event logging errors.
@@ -641,56 +780,40 @@ async function sendEmailAlert(to, subject, html) {
 
 async function runAlertChecks() {
   try {
-    const alerts = db
-      .prepare('SELECT * FROM alerts WHERE active = 1')
-      .all();
-    const priceAlerts = db
-      .prepare('SELECT * FROM price_alerts WHERE active = 1')
-      .all();
+    const alerts = await dbAll('SELECT * FROM alerts WHERE active = 1');
+    const priceAlerts = await dbAll('SELECT * FROM price_alerts WHERE active = 1');
+    const calendarReminders = await dbAll('SELECT * FROM calendar_reminders WHERE active = 1');
 
-    if (!alerts.length && !priceAlerts.length) return;
+    if (!alerts.length && !priceAlerts.length && !calendarReminders.length) return;
 
     const news = await getForexFactoryNews();
     const calendar = await getForexFactoryCalendar();
 
     const userTokens = new Map();
     const userWebSubs = new Map();
-    const getUserTokens = (userId) => {
+    const getUserTokens = async (userId) => {
       if (!userTokens.has(userId)) {
-        userTokens.set(
-          userId,
-          db
-            .prepare('SELECT token FROM push_tokens WHERE user_id = ?')
-            .all(userId)
-            .map((row) => row.token)
-        );
+        const rows = await dbAll('SELECT token FROM push_tokens WHERE user_id = $1', [userId]);
+        userTokens.set(userId, rows.map((row) => row.token));
       }
       return userTokens.get(userId);
     };
-    const getUserWebSubs = (userId) => {
+    const getUserWebSubs = async (userId) => {
       if (!userWebSubs.has(userId)) {
-        userWebSubs.set(
-          userId,
-          db
-            .prepare('SELECT subscription_json FROM web_push_subscriptions WHERE user_id = ?')
-            .all(userId)
-            .map((row) => JSON.parse(row.subscription_json))
+        const rows = await dbAll(
+          'SELECT subscription_json FROM web_push_subscriptions WHERE user_id = $1',
+          [userId]
         );
+        userWebSubs.set(userId, rows.map((row) => JSON.parse(row.subscription_json)));
       }
       return userWebSubs.get(userId);
     };
 
     for (const alert of alerts) {
-      const tokens = db
-        .prepare('SELECT token FROM push_tokens WHERE user_id = ?')
-        .all(alert.user_id)
-        .map((row) => row.token);
-      const webSubs = db
-        .prepare('SELECT subscription_json FROM web_push_subscriptions WHERE user_id = ?')
-        .all(alert.user_id)
-        .map((row) => JSON.parse(row.subscription_json));
+      const tokens = await getUserTokens(alert.user_id);
+      const webSubs = await getUserWebSubs(alert.user_id);
 
-      const user = getUserById(alert.user_id);
+      const user = await getUserById(alert.user_id);
       const emailEnabled = Boolean(user?.email_alerts);
       if (!tokens.length && !webSubs.length && !emailEnabled) continue;
 
@@ -703,7 +826,7 @@ async function runAlertChecks() {
         if (match) {
           const key = match.url || match.title;
           if (alert.last_sent_key === key) continue;
-          db.prepare('UPDATE alerts SET last_sent_key = ? WHERE id = ?').run(key, alert.id);
+          await dbRun('UPDATE alerts SET last_sent_key = $1 WHERE id = $2', [key, alert.id]);
           await sendExpoPush(
             tokens,
             'News alert',
@@ -711,7 +834,7 @@ async function runAlertChecks() {
             { url: match.url }
           );
           if (tokens.length) {
-            recordAlertEvent(
+            await recordAlertEvent(
               alert.user_id,
               'news',
               match.title,
@@ -726,7 +849,7 @@ async function runAlertChecks() {
             { url: match.url }
           );
           if (webSubs.length) {
-            recordAlertEvent(
+            await recordAlertEvent(
               alert.user_id,
               'news',
               match.title,
@@ -740,7 +863,7 @@ async function runAlertChecks() {
               `News alert: ${match.title}`,
               `<p>${match.title}</p><p><a href="${match.url}">Read source</a></p>`
             );
-            recordAlertEvent(
+            await recordAlertEvent(
               alert.user_id,
               'news',
               match.title,
@@ -760,7 +883,7 @@ async function runAlertChecks() {
         if (match) {
           const key = `${match.event}-${match.time || ''}`;
           if (alert.last_sent_key === key) continue;
-          db.prepare('UPDATE alerts SET last_sent_key = ? WHERE id = ?').run(key, alert.id);
+          await dbRun('UPDATE alerts SET last_sent_key = $1 WHERE id = $2', [key, alert.id]);
           const title = `${match.currency || ''} ${match.event}`.trim();
           await sendExpoPush(
             tokens,
@@ -769,7 +892,7 @@ async function runAlertChecks() {
             { event: match.event }
           );
           if (tokens.length) {
-            recordAlertEvent(
+            await recordAlertEvent(
               alert.user_id,
               'calendar',
               title,
@@ -784,7 +907,7 @@ async function runAlertChecks() {
             { event: match.event }
           );
           if (webSubs.length) {
-            recordAlertEvent(
+            await recordAlertEvent(
               alert.user_id,
               'calendar',
               title,
@@ -798,7 +921,7 @@ async function runAlertChecks() {
               'Calendar alert',
               `<p>${title}</p><p>Impact: ${match.impact || 'n/a'}</p>`
             );
-            recordAlertEvent(
+            await recordAlertEvent(
               alert.user_id,
               'calendar',
               title,
@@ -810,10 +933,57 @@ async function runAlertChecks() {
       }
     }
 
+    for (const reminder of calendarReminders) {
+      const user = await getUserById(reminder.user_id);
+      const emailEnabled = Boolean(user?.email_alerts);
+      const tokens = await getUserTokens(reminder.user_id);
+      const webSubs = await getUserWebSubs(reminder.user_id);
+      if (!tokens.length && !webSubs.length && !emailEnabled) continue;
+
+      const time = String(reminder.time || '');
+      if (!time || time.toLowerCase().includes('all')) continue;
+      const match = time.match(/(\\d{1,2}):(\\d{2})/);
+      if (!match) continue;
+      const now = new Date();
+      const target = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate(),
+        Number(match[1]),
+        Number(match[2]),
+        0
+      );
+      const trigger = new Date(target.getTime() - Number(reminder.minutes_before) * 60000);
+      const diff = trigger.getTime() - now.getTime();
+      if (diff > 60 * 1000 || diff < -2 * 60 * 1000) continue;
+
+      const key = `${reminder.event}-${reminder.time}-${reminder.minutes_before}`;
+      if (reminder.last_sent_key === key) continue;
+      await dbRun('UPDATE calendar_reminders SET last_sent_key = $1 WHERE id = $2', [
+        key,
+        reminder.id,
+      ]);
+
+      const title = `${reminder.currency || ''} ${reminder.event}`.trim();
+      const message = `${title} in ${reminder.minutes_before}m`;
+      await sendExpoPush(tokens, 'Calendar reminder', message, { event: reminder.event });
+      if (tokens.length) {
+        await recordAlertEvent(reminder.user_id, 'calendar_reminder', message, '', 'push');
+      }
+      await sendWebPush(webSubs, 'Calendar reminder', message, { event: reminder.event });
+      if (webSubs.length) {
+        await recordAlertEvent(reminder.user_id, 'calendar_reminder', message, '', 'web');
+      }
+      if (emailEnabled && user?.email) {
+        await sendEmailAlert(user.email, 'Calendar reminder', `<p>${message}</p>`);
+        await recordAlertEvent(reminder.user_id, 'calendar_reminder', message, '', 'email');
+      }
+    }
+
     for (const alert of priceAlerts) {
-      const tokens = getUserTokens(alert.user_id);
-      const webSubs = getUserWebSubs(alert.user_id);
-      const user = getUserById(alert.user_id);
+      const tokens = await getUserTokens(alert.user_id);
+      const webSubs = await getUserWebSubs(alert.user_id);
+      const user = await getUserById(alert.user_id);
       const emailEnabled = Boolean(user?.email_alerts);
       if (!tokens.length && !webSubs.length && !emailEnabled) continue;
 
@@ -837,18 +1007,18 @@ async function runAlertChecks() {
         if (hit) {
           const key = `${alert.pair}:${last}`;
           if (alert.last_sent_key === key) continue;
-          db.prepare('UPDATE price_alerts SET last_sent_key = ? WHERE id = ?').run(
+          await dbRun('UPDATE price_alerts SET last_sent_key = $1 WHERE id = $2', [
             key,
-            alert.id
-          );
+            alert.id,
+          ]);
           const message = `${alert.pair} is ${alert.direction} ${alert.value}`;
           await sendExpoPush(tokens, 'Price alert', message, { pair: alert.pair });
           await sendWebPush(webSubs, 'Price alert', message, { pair: alert.pair });
           if (tokens.length) {
-            recordAlertEvent(alert.user_id, 'price', message, '', 'push');
+            await recordAlertEvent(alert.user_id, 'price', message, '', 'push');
           }
           if (webSubs.length) {
-            recordAlertEvent(alert.user_id, 'price', message, '', 'web');
+            await recordAlertEvent(alert.user_id, 'price', message, '', 'web');
           }
           if (emailEnabled && user?.email) {
             await sendEmailAlert(
@@ -856,7 +1026,7 @@ async function runAlertChecks() {
               'Price alert',
               `<p>${message}</p>`
             );
-            recordAlertEvent(alert.user_id, 'price', message, '', 'email');
+            await recordAlertEvent(alert.user_id, 'price', message, '', 'email');
           }
         }
       }
@@ -870,18 +1040,18 @@ async function runAlertChecks() {
         if (hit) {
           const key = `${alert.pair}:${changePct.toFixed(2)}`;
           if (alert.last_sent_key === key) continue;
-          db.prepare('UPDATE price_alerts SET last_sent_key = ? WHERE id = ?').run(
+          await dbRun('UPDATE price_alerts SET last_sent_key = $1 WHERE id = $2', [
             key,
-            alert.id
-          );
+            alert.id,
+          ]);
           const message = `${alert.pair} moved ${changePct.toFixed(2)}% over ${windowDays}d`;
           await sendExpoPush(tokens, 'Percent alert', message, { pair: alert.pair });
           await sendWebPush(webSubs, 'Percent alert', message, { pair: alert.pair });
           if (tokens.length) {
-            recordAlertEvent(alert.user_id, 'percent', message, '', 'push');
+            await recordAlertEvent(alert.user_id, 'percent', message, '', 'push');
           }
           if (webSubs.length) {
-            recordAlertEvent(alert.user_id, 'percent', message, '', 'web');
+            await recordAlertEvent(alert.user_id, 'percent', message, '', 'web');
           }
           if (emailEnabled && user?.email) {
             await sendEmailAlert(
@@ -889,7 +1059,7 @@ async function runAlertChecks() {
               'Percent alert',
               `<p>${message}</p>`
             );
-            recordAlertEvent(alert.user_id, 'percent', message, '', 'email');
+            await recordAlertEvent(alert.user_id, 'percent', message, '', 'email');
           }
         }
       }
@@ -908,7 +1078,7 @@ app.post('/api/auth/register', async (req, res) => {
   if (isAdminEmail(email)) {
     return res.status(403).json({ error: 'Admin account must be created by the server.' });
   }
-  if (getUserByEmail(email)) {
+  if (await getUserByEmail(email)) {
     return res.status(409).json({ error: 'Account already exists.' });
   }
 
@@ -921,18 +1091,20 @@ app.post('/api/auth/register', async (req, res) => {
     created_at: new Date().toISOString(),
   };
 
-  db.prepare(
-    'INSERT INTO users (id, email, name, password_hash, created_at, email_alerts) VALUES (?, ?, ?, ?, ?, 0)'
-  ).run(user.id, user.email, user.name, user.password_hash, user.created_at);
+  await dbRun(
+    'INSERT INTO users (id, email, name, password_hash, created_at, email_alerts) VALUES ($1, $2, $3, $4, $5, 0)',
+    [user.id, user.email, user.name, user.password_hash, user.created_at]
+  );
 
-  const userCode = ensureReferralCode(user);
+  const userCode = await ensureReferralCode(user);
   if (refCode) {
-    const referrerId = getUserIdByReferralCode(String(refCode).trim());
+    const referrerId = await getUserIdByReferralCode(String(refCode).trim());
     if (referrerId && referrerId !== user.id) {
       try {
-        db.prepare(
-          'INSERT INTO referrals (id, referrer_user_id, referred_user_id, created_at) VALUES (?, ?, ?, ?)'
-        ).run(crypto.randomUUID(), referrerId, user.id, new Date().toISOString());
+        await dbRun(
+          'INSERT INTO referrals (id, referrer_user_id, referred_user_id, created_at) VALUES ($1, $2, $3, $4)',
+          [crypto.randomUUID(), referrerId, user.id, new Date().toISOString()]
+        );
       } catch (error) {
         // Ignore duplicate referrals.
       }
@@ -954,7 +1126,7 @@ app.post('/api/auth/register', async (req, res) => {
   });
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   const normalized = String(email || '').toLowerCase();
   const isAdmin = isAdminEmail(normalized);
@@ -962,7 +1134,7 @@ app.post('/api/auth/login', (req, res) => {
     if (!ADMIN_PASSWORD || password !== ADMIN_PASSWORD) {
       return res.status(401).json({ error: 'Invalid credentials.' });
     }
-    let user = getUserByEmail(normalized);
+    let user = await getUserByEmail(normalized);
     if (!user) {
       const passwordHash = bcrypt.hashSync(ADMIN_PASSWORD, 10);
       user = {
@@ -972,11 +1144,12 @@ app.post('/api/auth/login', (req, res) => {
         password_hash: passwordHash,
         created_at: new Date().toISOString(),
       };
-      db.prepare(
-        'INSERT INTO users (id, email, name, password_hash, created_at, email_alerts) VALUES (?, ?, ?, ?, ?, 0)'
-      ).run(user.id, user.email, user.name, user.password_hash, user.created_at);
+      await dbRun(
+        'INSERT INTO users (id, email, name, password_hash, created_at, email_alerts) VALUES ($1, $2, $3, $4, $5, 0)',
+        [user.id, user.email, user.name, user.password_hash, user.created_at]
+      );
     }
-    const code = ensureReferralCode(user);
+    const code = await ensureReferralCode(user);
     const token = createToken(user, true);
     return res.json({
       token,
@@ -991,13 +1164,12 @@ app.post('/api/auth/login', (req, res) => {
     });
   }
 
-  const user = getUserByEmail(normalized);
+  const user = await getUserByEmail(normalized);
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
     return res.status(401).json({ error: 'Invalid credentials.' });
   }
-
   const token = createToken(user, false);
-  const code = ensureReferralCode(user);
+  const code = await ensureReferralCode(user);
   return res.json({
     token,
     user: {
@@ -1011,9 +1183,9 @@ app.post('/api/auth/login', (req, res) => {
   });
 });
 
-app.get('/api/auth/me', requireAuth, (req, res) => {
+app.get('/api/auth/me', requireAuth, async (req, res) => {
   const user = req.user;
-  const code = ensureReferralCode(user);
+  const code = await ensureReferralCode(user);
   return res.json({
     user: {
       id: user.id,
@@ -1026,14 +1198,17 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   });
 });
 
-app.patch('/api/users/me', requireAuth, (req, res) => {
+app.patch('/api/users/me', requireAuth, async (req, res) => {
   const { emailAlerts } = req.body || {};
   if (typeof emailAlerts !== 'boolean') {
     return res.status(400).json({ error: 'emailAlerts must be boolean.' });
   }
-  db.prepare('UPDATE users SET email_alerts = ? WHERE id = ?').run(emailAlerts ? 1 : 0, req.user.id);
-  const user = getUserById(req.user.id);
-  const code = ensureReferralCode(user);
+  await dbRun('UPDATE users SET email_alerts = $1 WHERE id = $2', [
+    emailAlerts ? 1 : 0,
+    req.user.id,
+  ]);
+  const user = await getUserById(req.user.id);
+  const code = await ensureReferralCode(user);
   res.json({
     user: {
       id: user.id,
@@ -1046,68 +1221,71 @@ app.patch('/api/users/me', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/referrals/me', requireAuth, (req, res) => {
-  const code = ensureReferralCode(req.user);
-  const total = db
-    .prepare('SELECT COUNT(*) as count FROM referrals WHERE referrer_user_id = ?')
-    .get(req.user.id)?.count || 0;
-  const active = db
-    .prepare(
-      `SELECT COUNT(DISTINCT r.referred_user_id) as count
-       FROM referrals r
-       JOIN watchlist w ON w.user_id = r.referred_user_id
-       WHERE r.referrer_user_id = ?`
-    )
-    .get(req.user.id)?.count || 0;
+app.get('/api/referrals/me', requireAuth, async (req, res) => {
+  const code = await ensureReferralCode(req.user);
+  const totalRow = await dbGet(
+    'SELECT COUNT(*) as count FROM referrals WHERE referrer_user_id = $1',
+    [req.user.id]
+  );
+  const activeRow = await dbGet(
+    `SELECT COUNT(DISTINCT r.referred_user_id) as count
+     FROM referrals r
+     JOIN watchlist w ON w.user_id = r.referred_user_id
+     WHERE r.referrer_user_id = $1`,
+    [req.user.id]
+  );
   res.json({
     code,
-    total,
-    active,
+    total: Number(totalRow?.count || 0),
+    active: Number(activeRow?.count || 0),
   });
 });
 
-app.get('/api/watchlist', requireAuth, (req, res) => {
-  const rows = db
-    .prepare('SELECT symbol FROM watchlist WHERE user_id = ? ORDER BY created_at DESC')
-    .all(req.user.id);
+app.get('/api/watchlist', requireAuth, async (req, res) => {
+  const rows = await dbAll(
+    'SELECT symbol FROM watchlist WHERE user_id = $1 ORDER BY created_at DESC',
+    [req.user.id]
+  );
   res.json({ symbols: rows.map((row) => row.symbol) });
 });
 
-app.post('/api/watchlist', requireAuth, (req, res) => {
+app.post('/api/watchlist', requireAuth, async (req, res) => {
   const { symbol } = req.body || {};
   if (!symbol) {
     return res.status(400).json({ error: 'Symbol is required.' });
   }
   const normalized = String(symbol).toUpperCase();
   try {
-    db.prepare(
-      'INSERT INTO watchlist (id, user_id, symbol, created_at) VALUES (?, ?, ?, ?)'
-    ).run(crypto.randomUUID(), req.user.id, normalized, new Date().toISOString());
+    await dbRun(
+      'INSERT INTO watchlist (id, user_id, symbol, created_at) VALUES ($1, $2, $3, $4)',
+      [crypto.randomUUID(), req.user.id, normalized, new Date().toISOString()]
+    );
   } catch (error) {
     return res.status(409).json({ error: 'Already added.' });
   }
   return res.json({ ok: true, symbol: normalized });
 });
 
-app.delete('/api/watchlist/:symbol', requireAuth, (req, res) => {
+app.delete('/api/watchlist/:symbol', requireAuth, async (req, res) => {
   const symbol = String(req.params.symbol || '').toUpperCase();
-  db.prepare('DELETE FROM watchlist WHERE user_id = ? AND symbol = ?').run(
+  await dbRun('DELETE FROM watchlist WHERE user_id = $1 AND symbol = $2', [
     req.user.id,
-    symbol
-  );
+    symbol,
+  ]);
   return res.json({ ok: true });
 });
 
-app.post('/api/push/register', requireAuth, (req, res) => {
+app.post('/api/push/register', requireAuth, async (req, res) => {
   const { token, platform } = req.body || {};
   if (!token || !platform) {
     return res.status(400).json({ error: 'Token and platform are required.' });
   }
 
   try {
-    db.prepare(
-      'INSERT INTO push_tokens (id, user_id, token, platform, created_at) VALUES (?, ?, ?, ?, ?)'
-    ).run(crypto.randomUUID(), req.user.id, token, platform, new Date().toISOString());
+    await dbRun(
+      'INSERT INTO push_tokens (id, user_id, token, platform, created_at) VALUES ($1, $2, $3, $4, $5)',
+      [crypto.randomUUID(), req.user.id, token, platform, new Date().toISOString()]
+    );
   } catch (error) {
     // Ignore duplicates.
   }
@@ -1122,20 +1300,21 @@ app.get('/api/push/vapid-public-key', (_req, res) => {
   return res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
-app.post('/api/push/web/subscribe', requireAuth, (req, res) => {
+app.post('/api/push/web/subscribe', requireAuth, async (req, res) => {
   const { subscription } = req.body || {};
   if (!subscription?.endpoint) {
     return res.status(400).json({ error: 'Subscription endpoint required.' });
   }
   try {
-    db.prepare(
-      'INSERT INTO web_push_subscriptions (id, user_id, endpoint, subscription_json, created_at) VALUES (?, ?, ?, ?, ?)'
-    ).run(
-      crypto.randomUUID(),
-      req.user.id,
-      subscription.endpoint,
-      JSON.stringify(subscription),
-      new Date().toISOString()
+    await dbRun(
+      'INSERT INTO web_push_subscriptions (id, user_id, endpoint, subscription_json, created_at) VALUES ($1, $2, $3, $4, $5)',
+      [
+        crypto.randomUUID(),
+        req.user.id,
+        subscription.endpoint,
+        JSON.stringify(subscription),
+        new Date().toISOString(),
+      ]
     );
   } catch (error) {
     // Ignore duplicates.
@@ -1143,14 +1322,14 @@ app.post('/api/push/web/subscribe', requireAuth, (req, res) => {
   return res.json({ ok: true });
 });
 
-app.get('/api/announcements', (_req, res) => {
-  const rows = db
-    .prepare('SELECT id, title, body, created_at FROM announcements WHERE active = 1 ORDER BY created_at DESC')
-    .all();
+app.get('/api/announcements', async (_req, res) => {
+  const rows = await dbAll(
+    'SELECT id, title, body, created_at FROM announcements WHERE active = 1 ORDER BY created_at DESC'
+  );
   res.json({ announcements: rows });
 });
 
-app.post('/api/announcements', requireAuth, (req, res) => {
+app.post('/api/announcements', requireAuth, async (req, res) => {
   if (!req.isAdmin) {
     return res.status(403).json({ error: 'Admin only.' });
   }
@@ -1159,62 +1338,288 @@ app.post('/api/announcements', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'Title and body are required.' });
   }
   const id = crypto.randomUUID();
-  db.prepare(
-    'INSERT INTO announcements (id, title, body, active, created_at) VALUES (?, ?, ?, 1, ?)'
-  ).run(id, title.trim(), body.trim(), new Date().toISOString());
+  await dbRun(
+    'INSERT INTO announcements (id, title, body, active, created_at) VALUES ($1, $2, $3, 1, $4)',
+    [id, title.trim(), body.trim(), new Date().toISOString()]
+  );
   res.json({ ok: true, id });
 });
 
-app.delete('/api/announcements/:id', requireAuth, (req, res) => {
+app.delete('/api/announcements/:id', requireAuth, async (req, res) => {
   if (!req.isAdmin) {
     return res.status(403).json({ error: 'Admin only.' });
   }
-  db.prepare('DELETE FROM announcements WHERE id = ?').run(req.params.id);
+  await dbRun('DELETE FROM announcements WHERE id = $1', [req.params.id]);
   res.json({ ok: true });
 });
 
-app.get('/api/alerts', requireAuth, (req, res) => {
-  const rows = db
-    .prepare('SELECT id, type, query, impact, active, created_at FROM alerts WHERE user_id = ?')
-    .all(req.user.id);
+app.get('/api/alerts', requireAuth, async (req, res) => {
+  const rows = await dbAll(
+    'SELECT id, type, query, impact, active, created_at FROM alerts WHERE user_id = $1',
+    [req.user.id]
+  );
   res.json({ alerts: rows });
 });
 
-app.post('/api/alerts', requireAuth, (req, res) => {
+app.post('/api/alerts', requireAuth, async (req, res) => {
   const { type, query, impact } = req.body || {};
   if (!type || !['news_keyword', 'calendar_impact'].includes(type)) {
     return res.status(400).json({ error: 'Invalid alert type.' });
   }
   const id = crypto.randomUUID();
-  db.prepare(
-    'INSERT INTO alerts (id, user_id, type, query, impact, active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)'
-  ).run(id, req.user.id, type, query || null, impact || null, new Date().toISOString());
+  await dbRun(
+    'INSERT INTO alerts (id, user_id, type, query, impact, active, created_at) VALUES ($1, $2, $3, $4, $5, 1, $6)',
+    [id, req.user.id, type, query || null, impact || null, new Date().toISOString()]
+  );
   res.json({ ok: true, id });
 });
 
-app.delete('/api/alerts/:id', requireAuth, (req, res) => {
-  db.prepare('DELETE FROM alerts WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
+app.delete('/api/alerts/:id', requireAuth, async (req, res) => {
+  await dbRun('DELETE FROM alerts WHERE id = $1 AND user_id = $2', [
+    req.params.id,
+    req.user.id,
+  ]);
   res.json({ ok: true });
 });
 
-app.get('/api/price-alerts', requireAuth, (req, res) => {
-  const rows = db
-    .prepare('SELECT id, pair, type, direction, value, window_days, created_at FROM price_alerts WHERE user_id = ?')
-    .all(req.user.id);
+app.get('/api/calendar-reminders', requireAuth, async (req, res) => {
+  const rows = await dbAll(
+    'SELECT id, event, time, currency, minutes_before, created_at FROM calendar_reminders WHERE user_id = $1 ORDER BY created_at DESC',
+    [req.user.id]
+  );
+  res.json({ reminders: rows });
+});
+
+app.post('/api/calendar-reminders', requireAuth, async (req, res) => {
+  const { event, time, currency, minutesBefore } = req.body || {};
+  if (!event || !time || !minutesBefore) {
+    return res.status(400).json({ error: 'event, time, minutesBefore are required.' });
+  }
+  const id = crypto.randomUUID();
+  await dbRun(
+    'INSERT INTO calendar_reminders (id, user_id, event, time, currency, minutes_before, active, created_at) VALUES ($1, $2, $3, $4, $5, $6, 1, $7)',
+    [
+      id,
+      req.user.id,
+      String(event),
+      String(time),
+      currency ? String(currency) : null,
+      Number(minutesBefore),
+      new Date().toISOString(),
+    ]
+  );
+  res.json({ ok: true, id });
+});
+
+app.delete('/api/calendar-reminders/:id', requireAuth, async (req, res) => {
+  await dbRun('DELETE FROM calendar_reminders WHERE id = $1 AND user_id = $2', [
+    req.params.id,
+    req.user.id,
+  ]);
+  res.json({ ok: true });
+});
+
+app.get('/api/community/posts', async (_req, res) => {
+  const posts = await dbAll(
+    `SELECT p.id, p.title, p.body, p.created_at, u.name as author
+     FROM community_posts p
+     JOIN users u ON u.id = p.user_id
+     ORDER BY p.created_at DESC`
+  );
+  res.json({ posts });
+});
+
+app.post('/api/community/posts', requireAuth, async (req, res) => {
+  const { title, body } = req.body || {};
+  if (!title || !body) {
+    return res.status(400).json({ error: 'Title and body are required.' });
+  }
+  const id = crypto.randomUUID();
+  await dbRun(
+    'INSERT INTO community_posts (id, user_id, title, body, created_at) VALUES ($1, $2, $3, $4, $5)',
+    [id, req.user.id, String(title), String(body), new Date().toISOString()]
+  );
+  res.json({ ok: true, id });
+});
+
+app.get('/api/community/posts/:id/comments', async (req, res) => {
+  const rows = await dbAll(
+    `SELECT c.id, c.body, c.created_at, u.name as author
+     FROM community_comments c
+     JOIN users u ON u.id = c.user_id
+     WHERE c.post_id = $1
+     ORDER BY c.created_at DESC`,
+    [req.params.id]
+  );
+  res.json({ comments: rows });
+});
+
+app.post('/api/community/posts/:id/comments', requireAuth, async (req, res) => {
+  const { body } = req.body || {};
+  if (!body) {
+    return res.status(400).json({ error: 'Body is required.' });
+  }
+  const id = crypto.randomUUID();
+  await dbRun(
+    'INSERT INTO community_comments (id, post_id, user_id, body, created_at) VALUES ($1, $2, $3, $4, $5)',
+    [id, req.params.id, req.user.id, String(body), new Date().toISOString()]
+  );
+  res.json({ ok: true, id });
+});
+
+app.get('/api/forum/threads', async (_req, res) => {
+  const rows = await dbAll(
+    `SELECT t.id, t.title, t.body, t.tags, t.created_at, u.name as author
+     FROM forum_threads t
+     JOIN users u ON u.id = t.user_id
+     ORDER BY t.created_at DESC`
+  );
+  res.json({ threads: rows });
+});
+
+app.post('/api/forum/threads', requireAuth, async (req, res) => {
+  const { title, body, tags } = req.body || {};
+  if (!title || !body) {
+    return res.status(400).json({ error: 'Title and body are required.' });
+  }
+  const id = crypto.randomUUID();
+  await dbRun(
+    'INSERT INTO forum_threads (id, user_id, title, body, tags, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+    [id, req.user.id, String(title), String(body), String(tags || ''), new Date().toISOString()]
+  );
+  res.json({ ok: true, id });
+});
+
+app.get('/api/forum/threads/:id/replies', async (req, res) => {
+  const rows = await dbAll(
+    `SELECT r.id, r.body, r.created_at, u.name as author
+     FROM forum_replies r
+     JOIN users u ON u.id = r.user_id
+     WHERE r.thread_id = $1
+     ORDER BY r.created_at DESC`,
+    [req.params.id]
+  );
+  res.json({ replies: rows });
+});
+
+app.post('/api/forum/threads/:id/replies', requireAuth, async (req, res) => {
+  const { body } = req.body || {};
+  if (!body) {
+    return res.status(400).json({ error: 'Body is required.' });
+  }
+  const id = crypto.randomUUID();
+  await dbRun(
+    'INSERT INTO forum_replies (id, thread_id, user_id, body, created_at) VALUES ($1, $2, $3, $4, $5)',
+    [id, req.params.id, req.user.id, String(body), new Date().toISOString()]
+  );
+  res.json({ ok: true, id });
+});
+
+app.get('/api/chat/messages', async (_req, res) => {
+  const rows = await dbAll(
+    `SELECT m.id, m.body, m.created_at, u.name as author
+     FROM chat_messages m
+     JOIN users u ON u.id = m.user_id
+     ORDER BY m.created_at DESC
+     LIMIT 100`
+  );
+  res.json({ messages: rows.reverse() });
+});
+
+app.post('/api/chat/messages', requireAuth, async (req, res) => {
+  const { body } = req.body || {};
+  if (!body) {
+    return res.status(400).json({ error: 'Body is required.' });
+  }
+  const id = crypto.randomUUID();
+  await dbRun(
+    'INSERT INTO chat_messages (id, user_id, body, created_at) VALUES ($1, $2, $3, $4)',
+    [id, req.user.id, String(body), new Date().toISOString()]
+  );
+  res.json({ ok: true, id });
+});
+
+app.get('/api/trades', requireAuth, async (req, res) => {
+  const rows = await dbAll(
+    'SELECT id, symbol, entry_price, exit_price, size, pnl, reasoning, created_at FROM trade_journal WHERE user_id = $1 ORDER BY created_at DESC',
+    [req.user.id]
+  );
+  res.json({ trades: rows });
+});
+
+app.post('/api/trades', requireAuth, async (req, res) => {
+  const { symbol, entryPrice, exitPrice, size, pnl, reasoning } = req.body || {};
+  if (!symbol) {
+    return res.status(400).json({ error: 'symbol is required.' });
+  }
+  const id = crypto.randomUUID();
+  await dbRun(
+    'INSERT INTO trade_journal (id, user_id, symbol, entry_price, exit_price, size, pnl, reasoning, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+    [
+      id,
+      req.user.id,
+      String(symbol).toUpperCase(),
+      entryPrice ? Number(entryPrice) : null,
+      exitPrice ? Number(exitPrice) : null,
+      size ? Number(size) : null,
+      pnl ? Number(pnl) : null,
+      reasoning ? String(reasoning) : null,
+      new Date().toISOString(),
+    ]
+  );
+  res.json({ ok: true, id });
+});
+
+app.delete('/api/trades/:id', requireAuth, async (req, res) => {
+  await dbRun('DELETE FROM trade_journal WHERE id = $1 AND user_id = $2', [
+    req.params.id,
+    req.user.id,
+  ]);
+  res.json({ ok: true });
+});
+
+app.get('/api/price-alerts', requireAuth, async (req, res) => {
+  const rows = await dbAll(
+    'SELECT id, pair, type, direction, value, window_days, created_at FROM price_alerts WHERE user_id = $1',
+    [req.user.id]
+  );
   res.json({ alerts: rows });
 });
 
-app.get('/api/alert-events', requireAuth, (req, res) => {
+app.get('/api/alert-events', requireAuth, async (req, res) => {
   const limit = Math.max(10, Math.min(200, Number(req.query?.limit) || 50));
-  const rows = db
-    .prepare(
-      'SELECT id, type, title, detail, channel, created_at FROM alert_events WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'
-    )
-    .all(req.user.id, limit);
+  const rows = await dbAll(
+    'SELECT id, type, title, detail, channel, created_at FROM alert_events WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2',
+    [req.user.id, limit]
+  );
   res.json({ events: rows });
 });
 
-app.post('/api/price-alerts', requireAuth, (req, res) => {
+app.get('/api/recap/weekly', requireAuth, async (req, res) => {
+  const rows = await dbAll(
+    'SELECT symbol FROM watchlist WHERE user_id = $1 ORDER BY created_at DESC',
+    [req.user.id]
+  );
+  const pairs = rows.map((row) => row.symbol);
+  const movers = [];
+  for (const pair of pairs) {
+    try {
+      const series = await getForexSeries(pair, 7);
+      const points = series.points || [];
+      if (points.length < 2) continue;
+      const first = points[0].value;
+      const last = points[points.length - 1].value;
+      const changePct = ((last - first) / first) * 100;
+      movers.push({ pair, changePct });
+    } catch (error) {
+      // skip
+    }
+  }
+  movers.sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
+  res.json({ movers: movers.slice(0, 5) });
+});
+
+app.post('/api/price-alerts', requireAuth, async (req, res) => {
   const { pair, type, direction, value, windowDays } = req.body || {};
   if (!pair || !type || !direction || !value) {
     return res.status(400).json({ error: 'pair, type, direction, value are required.' });
@@ -1226,28 +1631,38 @@ app.post('/api/price-alerts', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'Invalid direction.' });
   }
   const id = crypto.randomUUID();
-  db.prepare(
-    'INSERT INTO price_alerts (id, user_id, pair, type, direction, value, window_days, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)'
-  ).run(
-    id,
-    req.user.id,
-    String(pair).toUpperCase(),
-    type,
-    direction,
-    Number(value),
-    Number(windowDays || 1),
-    new Date().toISOString()
+  await dbRun(
+    'INSERT INTO price_alerts (id, user_id, pair, type, direction, value, window_days, active, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8)',
+    [
+      id,
+      req.user.id,
+      String(pair).toUpperCase(),
+      type,
+      direction,
+      Number(value),
+      Number(windowDays || 1),
+      new Date().toISOString(),
+    ]
   );
   res.json({ ok: true, id });
 });
 
-app.delete('/api/price-alerts/:id', requireAuth, (req, res) => {
-  db.prepare('DELETE FROM price_alerts WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
+app.delete('/api/price-alerts/:id', requireAuth, async (req, res) => {
+  await dbRun('DELETE FROM price_alerts WHERE id = $1 AND user_id = $2', [
+    req.params.id,
+    req.user.id,
+  ]);
   res.json({ ok: true });
 });
 
-app.listen(PORT, () => {
-  console.log(`API listening on http://localhost:${PORT}`);
-});
-
-setInterval(runAlertChecks, ALERT_POLL_MS);
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`API listening on http://localhost:${PORT}`);
+    });
+    setInterval(runAlertChecks, ALERT_POLL_MS);
+  })
+  .catch((error) => {
+    console.error('Failed to initialize database:', error);
+    process.exit(1);
+  });
