@@ -9,6 +9,12 @@ const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Database = require('better-sqlite3');
+let webPush;
+try {
+  webPush = require('web-push');
+} catch (error) {
+  webPush = null;
+}
 
 const app = express();
 
@@ -16,6 +22,9 @@ const PORT = process.env.PORT || 4000;
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60 * 1000);
 const ALERT_POLL_MS = Number(process.env.ALERT_POLL_MS || 3 * 60 * 1000);
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@example.com';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 
 app.use(cors());
@@ -70,6 +79,15 @@ db.exec(`
     active INTEGER NOT NULL DEFAULT 1,
     last_sent_key TEXT,
     created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+  CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    subscription_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(user_id, endpoint),
     FOREIGN KEY(user_id) REFERENCES users(id)
   );
 `);
@@ -301,6 +319,27 @@ async function sendExpoPush(tokens, title, body, data = {}) {
   });
 }
 
+async function sendWebPush(subscriptions, title, body, data = {}) {
+  if (!webPush || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  webPush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+  const payload = JSON.stringify({ title, body, data });
+
+  await Promise.all(
+    subscriptions.map(async (subscription) => {
+      try {
+        await webPush.sendNotification(subscription, payload);
+      } catch (error) {
+        // Remove invalid subscriptions.
+        if (error?.statusCode === 410 || error?.statusCode === 404) {
+          db.prepare('DELETE FROM web_push_subscriptions WHERE endpoint = ?').run(
+            subscription.endpoint
+          );
+        }
+      }
+    })
+  );
+}
+
 async function runAlertChecks() {
   try {
     const alerts = db
@@ -317,8 +356,12 @@ async function runAlertChecks() {
         .prepare('SELECT token FROM push_tokens WHERE user_id = ?')
         .all(alert.user_id)
         .map((row) => row.token);
+      const webSubs = db
+        .prepare('SELECT subscription_json FROM web_push_subscriptions WHERE user_id = ?')
+        .all(alert.user_id)
+        .map((row) => JSON.parse(row.subscription_json));
 
-      if (!tokens.length) continue;
+      if (!tokens.length && !webSubs.length) continue;
 
       if (alert.type === 'news_keyword') {
         const keyword = normalizeKey(alert.query);
@@ -332,6 +375,12 @@ async function runAlertChecks() {
           db.prepare('UPDATE alerts SET last_sent_key = ? WHERE id = ?').run(key, alert.id);
           await sendExpoPush(
             tokens,
+            'News alert',
+            match.title,
+            { url: match.url }
+          );
+          await sendWebPush(
+            webSubs,
             'News alert',
             match.title,
             { url: match.url }
@@ -351,6 +400,12 @@ async function runAlertChecks() {
           db.prepare('UPDATE alerts SET last_sent_key = ? WHERE id = ?').run(key, alert.id);
           await sendExpoPush(
             tokens,
+            'Calendar alert',
+            `${match.currency || ''} ${match.event}`.trim(),
+            { event: match.event }
+          );
+          await sendWebPush(
+            webSubs,
             'Calendar alert',
             `${match.currency || ''} ${match.event}`.trim(),
             { event: match.event }
@@ -456,6 +511,34 @@ app.post('/api/push/register', requireAuth, (req, res) => {
     // Ignore duplicates.
   }
 
+  return res.json({ ok: true });
+});
+
+app.get('/api/push/vapid-public-key', (_req, res) => {
+  if (!VAPID_PUBLIC_KEY) {
+    return res.status(500).json({ error: 'VAPID not configured.' });
+  }
+  return res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+app.post('/api/push/web/subscribe', requireAuth, (req, res) => {
+  const { subscription } = req.body || {};
+  if (!subscription?.endpoint) {
+    return res.status(400).json({ error: 'Subscription endpoint required.' });
+  }
+  try {
+    db.prepare(
+      'INSERT INTO web_push_subscriptions (id, user_id, endpoint, subscription_json, created_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(
+      crypto.randomUUID(),
+      req.user.id,
+      subscription.endpoint,
+      JSON.stringify(subscription),
+      new Date().toISOString()
+    );
+  } catch (error) {
+    // Ignore duplicates.
+  }
   return res.json({ ok: true });
 });
 
