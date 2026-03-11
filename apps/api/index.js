@@ -145,6 +145,10 @@ function parseNewsFallback($) {
     const href = $(el).attr('href');
     const title = normalizeText($(el).text());
     if (!href || !title) return;
+    if (href.includes('/hit')) return;
+    if (href.includes('#')) return;
+    if (/^from\s/i.test(title)) return;
+    if (/\bcomments?\b/i.test(title)) return;
     if (seen.has(href)) return;
     seen.add(href);
     items.push({
