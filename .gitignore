@@ -1,0 +1,15 @@
+node_modules
+.env
+.env.*
+.DS_Store
+dist
+web-build
+build
+.expo
+.expo-shared
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+**/.DS_Store
+**/node_modules
+apps/api/data
