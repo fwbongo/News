@@ -91,6 +91,19 @@ db.exec(`
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS price_alerts (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    pair TEXT NOT NULL,
+    type TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    value REAL NOT NULL,
+    window_days INTEGER,
+    active INTEGER NOT NULL DEFAULT 1,
+    last_sent_key TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
   CREATE TABLE IF NOT EXISTS web_push_subscriptions (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -423,11 +436,41 @@ async function runAlertChecks() {
     const alerts = db
       .prepare('SELECT * FROM alerts WHERE active = 1')
       .all();
+    const priceAlerts = db
+      .prepare('SELECT * FROM price_alerts WHERE active = 1')
+      .all();
 
-    if (!alerts.length) return;
+    if (!alerts.length && !priceAlerts.length) return;
 
     const news = await getForexFactoryNews();
     const calendar = await getForexFactoryCalendar();
+
+    const userTokens = new Map();
+    const userWebSubs = new Map();
+    const getUserTokens = (userId) => {
+      if (!userTokens.has(userId)) {
+        userTokens.set(
+          userId,
+          db
+            .prepare('SELECT token FROM push_tokens WHERE user_id = ?')
+            .all(userId)
+            .map((row) => row.token)
+        );
+      }
+      return userTokens.get(userId);
+    };
+    const getUserWebSubs = (userId) => {
+      if (!userWebSubs.has(userId)) {
+        userWebSubs.set(
+          userId,
+          db
+            .prepare('SELECT subscription_json FROM web_push_subscriptions WHERE user_id = ?')
+            .all(userId)
+            .map((row) => JSON.parse(row.subscription_json))
+        );
+      }
+      return userWebSubs.get(userId);
+    };
 
     for (const alert of alerts) {
       const tokens = db
@@ -488,6 +531,61 @@ async function runAlertChecks() {
             `${match.currency || ''} ${match.event}`.trim(),
             { event: match.event }
           );
+        }
+      }
+    }
+
+    for (const alert of priceAlerts) {
+      const tokens = getUserTokens(alert.user_id);
+      const webSubs = getUserWebSubs(alert.user_id);
+      if (!tokens.length && !webSubs.length) continue;
+
+      const windowDays = Number(alert.window_days || 1);
+      let series;
+      try {
+        series = await getForexSeries(alert.pair, Math.max(2, windowDays));
+      } catch (error) {
+        continue;
+      }
+      const points = series.points || [];
+      if (points.length < 2) continue;
+
+      const last = points[points.length - 1].value;
+      const first = points[0].value;
+
+      if (alert.type === 'price') {
+        const hit =
+          (alert.direction === 'above' && last >= alert.value) ||
+          (alert.direction === 'below' && last <= alert.value);
+        if (hit) {
+          const key = `${alert.pair}:${last}`;
+          if (alert.last_sent_key === key) continue;
+          db.prepare('UPDATE price_alerts SET last_sent_key = ? WHERE id = ?').run(
+            key,
+            alert.id
+          );
+          const message = `${alert.pair} is ${alert.direction} ${alert.value}`;
+          await sendExpoPush(tokens, 'Price alert', message, { pair: alert.pair });
+          await sendWebPush(webSubs, 'Price alert', message, { pair: alert.pair });
+        }
+      }
+
+      if (alert.type === 'percent') {
+        const changePct = ((last - first) / first) * 100;
+        const threshold = Number(alert.value);
+        const hit =
+          (alert.direction === 'above' && changePct >= threshold) ||
+          (alert.direction === 'below' && changePct <= -threshold);
+        if (hit) {
+          const key = `${alert.pair}:${changePct.toFixed(2)}`;
+          if (alert.last_sent_key === key) continue;
+          db.prepare('UPDATE price_alerts SET last_sent_key = ? WHERE id = ?').run(
+            key,
+            alert.id
+          );
+          const message = `${alert.pair} moved ${changePct.toFixed(2)}% over ${windowDays}d`;
+          await sendExpoPush(tokens, 'Percent alert', message, { pair: alert.pair });
+          await sendWebPush(webSubs, 'Percent alert', message, { pair: alert.pair });
         }
       }
     }
@@ -700,6 +798,45 @@ app.post('/api/alerts', requireAuth, (req, res) => {
 
 app.delete('/api/alerts/:id', requireAuth, (req, res) => {
   db.prepare('DELETE FROM alerts WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
+  res.json({ ok: true });
+});
+
+app.get('/api/price-alerts', requireAuth, (req, res) => {
+  const rows = db
+    .prepare('SELECT id, pair, type, direction, value, window_days, created_at FROM price_alerts WHERE user_id = ?')
+    .all(req.user.id);
+  res.json({ alerts: rows });
+});
+
+app.post('/api/price-alerts', requireAuth, (req, res) => {
+  const { pair, type, direction, value, windowDays } = req.body || {};
+  if (!pair || !type || !direction || !value) {
+    return res.status(400).json({ error: 'pair, type, direction, value are required.' });
+  }
+  if (!['price', 'percent'].includes(type)) {
+    return res.status(400).json({ error: 'Invalid alert type.' });
+  }
+  if (!['above', 'below'].includes(direction)) {
+    return res.status(400).json({ error: 'Invalid direction.' });
+  }
+  const id = crypto.randomUUID();
+  db.prepare(
+    'INSERT INTO price_alerts (id, user_id, pair, type, direction, value, window_days, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)'
+  ).run(
+    id,
+    req.user.id,
+    String(pair).toUpperCase(),
+    type,
+    direction,
+    Number(value),
+    Number(windowDays || 1),
+    new Date().toISOString()
+  );
+  res.json({ ok: true, id });
+});
+
+app.delete('/api/price-alerts/:id', requireAuth, (req, res) => {
+  db.prepare('DELETE FROM price_alerts WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
   res.json({ ok: true });
 });
 
